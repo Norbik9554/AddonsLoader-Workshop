@@ -1,0 +1,2 @@
+# Wtyczka używa tylko biblioteki standardowej, PySide6 i pakietów dostarczanych przez Loader w plugin_libs
+# (psutil, wmi, comtypes, pywin32) — lista zależności jest pusta.

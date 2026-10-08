@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "plugins": [
+    {
+      "id": "AutoLan",
+      "name": "AutoLan v1",
+      "version": "1.0.0",
+      "author": "Norbik9554",
+      "category": "Sieć",
+      "description": "Pilnuje 3-godzinnego dostępu LAN (PacketFence, Politechnika Lubelska): licznik, powiadomienia 10/5/2/1 min, automatyczne odnowienie z tymczasowym rozłączeniem Proton VPN i nadzór nad zawieszonym klientem Protona.",
+      "tags": [
+        "lan",
+        "vpn",
+        "proton",
+        "windows",
+        "eduroam"
+      ],
+      "platform": "windows",
+      "min_client": "0.0.5",
+      "grid": {
+        "width": 7,
+        "height": 9
+      },
+      "permissions": {
+        "network": true,
+        "ui_automation": true,
+        "scheduled_task": "tylko budzik komputera (cmd /c exit)"
+      },
+      "data": "Login, hasło i data wygaśnięcia są szyfrowane DPAPI w client/plugin_data/<folder>/ — nie wchodzą do paczki.",
+      "file": "plugins/AutoLan/AutoLan-1.0.0.zip",
+      "url": "https://raw.githubusercontent.com/Norbik9554/AddonsLoader-Workshop/main/plugins/AutoLan/AutoLan-1.0.0.zip",
+      "sha256": "13cf0d609298d841fdb733b404315841e1676914f6ec2a8738238dfc49354c1a",
+      "size": 28491,
+      "signed": false
+    }
+  ]
+}
