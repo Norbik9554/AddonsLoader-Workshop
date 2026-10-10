@@ -32,6 +32,25 @@
       "sha256": "13cf0d609298d841fdb733b404315841e1676914f6ec2a8738238dfc49354c1a",
       "size": 28491,
       "signed": false
+    },
+    {
+      "id": "SystemInfo",
+      "name": "FullInfo",
+      "version": "0.0.1",
+      "author": "Społeczność",
+      "category": "System",
+      "description": "Sprawdź swój komp i jego paramtery",
+      "tags": [
+        "społeczność"
+      ],
+      "platform": "windows",
+      "min_client": "0.0.5",
+      "permissions": {},
+      "file": "plugins/SystemInfo/SystemInfo-0.0.1.zip",
+      "url": "https://raw.githubusercontent.com/Norbik9554/AddonsLoader-Workshop/main/plugins/SystemInfo/SystemInfo-0.0.1.zip",
+      "sha256": "54e4b14ad6073da183f05e3ef0177e44936912821a479001edc0bcc476e3bde0",
+      "size": 11072,
+      "signed": false
     }
   ]
 }
