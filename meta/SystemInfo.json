@@ -1,0 +1,10 @@
+{
+  "id": "SystemInfo",
+  "name": "FullInfo",
+  "version": "0.0.1",
+  "author": "Społeczność",
+  "category": "System",
+  "description": "Sprawdź swój komp i jego paramtery",
+  "platform": "windows",
+  "min_client": "0.0.5"
+}
