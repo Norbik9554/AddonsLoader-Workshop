@@ -1,0 +1,8 @@
+# Każda zmiana kodu wtyczek, paczek, manifestu i narzędzi wymaga przeglądu właściciela.
+* @Norbik9554
+/src/ @Norbik9554
+/plugins/ @Norbik9554
+/signatures/ @Norbik9554
+/keys/ @Norbik9554
+/manifest.json @Norbik9554
+/tools/ @Norbik9554
