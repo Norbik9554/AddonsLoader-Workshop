@@ -59,11 +59,12 @@ Układ: wszystkie wpisy w folderze `<id>/`, razem z `<id>/plugin.sig`; nazwa pli
 Podpis liczy się na **rozpakowanych plikach**, więc ZIP trzeba budować dopiero po podpisaniu folderu `src/<id>/`
 (podpis zmienia zawartość paczki, a więc jej sumę SHA-256 w manifeście).
 
-Zasady, które narzędzie sprawdza przed rozpakowaniem (zalecane też dla klienta, gdy powstanie kod pobierania):
-maks. 200 plików, 5 MiB na plik, 20 MiB łącznie, stosunek rozpakowania do skompresowanego ≤ 100; segmenty ścieżki `[A-Za-z0-9._-]`,
-bez `..`, `\`, `:`, końcowej kropki i nazw zarezerwowanych Windows (`CON`, `NUL`, `COM1`…); bez duplikatów po porównaniu bez względu na
-wielkość liter; bez dowiązań, wpisów zaszyfrowanych i wpisów poza `<id>/`; **bez `__pycache__` i plików `.pyc`/`.pyo`** (podpis ich nie obejmuje,
-a Python mógłby je załadować). Serwer (`scan_workshop_zip`) ma własne, nieco luźniejsze limity (10 MB na plik) i odrzuca zgłoszenia z `plugin.sig`:
+Zasady, które przed rozpakowaniem sprawdza narzędzie (`verify` dla ZIP-a) i — te same — klient przy instalacji z Workshopu
+(`client/workshop_install.py`): maks. 200 plików, 5 MiB na plik, 20 MiB łącznie, stosunek rozpakowania do skompresowanego ≤ 100;
+tylko kompresja STORED albo DEFLATED (bzip2/lzma odrzucane); segmenty ścieżki `[A-Za-z0-9._-]`,
+bez `..`, `\`, `:`, końcowej kropki i nazw zarezerwowanych Windows (`CON`, `NUL`, `COM1`…, także jako folder główny); bez duplikatów po
+porównaniu bez względu na wielkość liter i bez tej samej nazwy jako pliku i folderu; bez dowiązań, wpisów zaszyfrowanych i wpisów poza `<id>/`;
+**bez `__pycache__` i plików `.pyc`/`.pyo`** (podpis ich nie obejmuje, a Python mógłby je załadować). Serwer (`scan_workshop_zip`) ma własne, nieco luźniejsze limity (10 MB na plik) i odrzuca zgłoszenia z `plugin.sig`:
 podpis oficjalny dodaje wyłącznie właściciel, po przeglądzie.
 
 ## Wydanie oficjalnej wtyczki
@@ -72,7 +73,10 @@ podpis oficjalny dodaje wyłącznie właściciel, po przeglądzie.
 2. `python tools/sign_plugin.py sign src/<id> --key <klucz.pem> --version <wersja>` — zapisuje `src/<id>/plugin.sig`
    (hasło: zmienna `SIGN_KEY_PASSWORD` albo pytanie w terminalu).
 3. `python tools/build_manifest.py` — buduje ZIP z `src/<id>/` **razem z `plugin.sig`** i aktualizuje manifest.
-   *Do sprawdzenia przy pierwszym wydaniu: że builder nie pomija `plugin.sig` i że nie dodaje innych plików poza podpisanymi.*
+   *Do sprawdzenia przy pierwszym wydaniu: że builder nie pomija `plugin.sig` ani żadnego podpisanego pliku (np. `README.md`,
+   `requirements.txt`) i nie dodaje innych; że pakuje DEFLATED; że `sha256` w manifeście to suma **ostatecznego** ZIP-a zapisana małymi
+   literami (serwer odrzuca inną postać, a klient wtedy nie instaluje), a `size` — jego dokładna liczba bajtów. ZIP buduj na tej samej
+   maszynie, na której podpisałeś: konwersja końców linii (CRLF/LF) przez Git między podpisem a pakowaniem = `plik_zmieniony`.*
 4. `python tools/sign_plugin.py verify plugins/<id>/<id>-<wersja>.zip --pub <klucz_publiczny_base64>` — kod 0 = oficjalna.
 5. Commit i push.
 
@@ -95,13 +99,16 @@ Algorytm narzędzia jest kopią algorytmu klienta. Test zgodności (`TestZgodnos
 
 ## Znane ograniczenia (stan na dziś)
 
-- **Klient nie pobiera jeszcze wtyczek z Workshopu** (brak kodu pobierania w `client/`), więc sumy SHA-256 z manifestu, zasady paczki i `plugin.sig` nie są egzekwowane przy instalacji.
-  Do czasu wdrożenia to jest tylko plan; sprawdzanie `plugin.sig` działa dla wtyczek leżących w folderze klienta.
+- Klient instaluje wtyczki z Workshopu (`client/workshop_install.py`, okno `workshop_ui.py`): adres tylko z tego repozytorium na
+  `raw.githubusercontent.com`, rozmiar i SHA-256 z indeksu sprawdzane przed otwarciem ZIP-a, zasady paczki jak wyżej, `plugin.sig`;
+  wersja z indeksu, z nazwy ZIP-a i z podpisu muszą być równe. Niepodpisana — tylko za zgodą użytkownika; zły podpis — odrzucenie.
 - Brak podpisu manifestu, numeru sekwencyjnego i daty wygaśnięcia: kto zmieni repozytorium, może podmienić paczkę i sumę. Podpis `plugin.sig` ogranicza
   szkody tylko tyle, że podmieniona paczka nie dostanie statusu „oficjalna”.
 - Brak odwołania pojedynczej wersji i klucza oraz blokady downgrade'u (nowsza wersja nie jest wymuszana).
-- Podpis wiąże wtyczkę z nazwą folderu i wersją z `payload`, ale klient nie porównuje wersji z manifestem.
-- `.pyc` i `__pycache__` nie są objęte podpisem — klient powinien je ignorować albo usuwać przed uruchomieniem wtyczki.
+- Wersja jest porównywana z indeksem tylko przy instalacji z Workshopu; wtyczki już leżącej w folderze klient z manifestem nie porównuje.
+- `.pyc` i `__pycache__` nie są objęte podpisem — klient usuwa je przed pierwszym wykonaniem wtyczki (`plugin_trust.remove_bytecode`).
+- Pliki, które wtyczka zapisze we **własnym** folderze, są „dodatkowe” względem podpisu i blokują ją przy następnym skanie. Dane trzymaj
+  w `plugin_data/<id>` obok folderu wtyczek (katalog roboczy procesu wtyczki to katalog nadrzędny folderu wtyczek).
 - Serwer wymaga w manifeście `schema == 1` (`_workshop_oczysc`); każda zmiana schematu manifestu musi iść razem ze zmianą serwera.
 
 ## Możliwe rozszerzenia (nie robione)

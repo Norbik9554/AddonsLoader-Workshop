@@ -219,6 +219,51 @@ class TestPaczka(Baza):
             sp.rozpakuj_paczke(z, tmp)
         self.odrzuca(nazwa="Inna-1.0.0.zip")
 
+    # Reguły, które klient (workshop_install.rozpakuj_paczke) egzekwuje przy instalacji — verify musi odrzucać to samo.
+    def test_tylko_stored_i_deflated(self):
+        for metoda in (zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA):
+            z = self.d / "Demo-1.0.0.zip"
+            with zipfile.ZipFile(z, "w") as zf:
+                zf.writestr(zipfile.ZipInfo("Demo/logic.py", (2026, 1, 1, 0, 0, 0)), b"x=1\n", compress_type=metoda)
+            with tempfile.TemporaryDirectory() as tmp, self.assertRaises(sp.Blad):
+                sp.rozpakuj_paczke(z, tmp)
+        z = self.d / "Demo-1.0.0.zip"
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr(zipfile.ZipInfo("Demo/logic.py", (2026, 1, 1, 0, 0, 0)), b"x=1\n", compress_type=zipfile.ZIP_STORED)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(sp.rozpakuj_paczke(z, tmp), ("Demo", "1.0.0"))
+
+    def test_plik_i_folder_o_tej_samej_nazwie(self):
+        self.odrzuca(dodatkowe=[("Demo/sub", b"x", 0o100644 << 16)])
+        self.odrzuca(dodatkowe=[("Demo/SUB", b"x", 0o100644 << 16)])
+
+    def test_folder_glowny_o_nazwie_zarezerwowanej(self):
+        z = self.d / "NUL-1.0.0.zip"
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("NUL/logic.py", b"x=1\n")
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(sp.Blad):
+            sp.rozpakuj_paczke(z, tmp)
+
+    def test_zly_crc_to_blad_a_nie_wyjatek(self):
+        z = spakuj(self.folder, self.d / "Demo-1.0.0.zip")
+        dane = bytearray(z.read_bytes())
+        i = dane.find(b"print('hi')")
+        if i < 0:   # DEFLATED: treść nieczytelna wprost — psujemy pierwszy bajt danych pierwszego wpisu
+            with zipfile.ZipFile(z) as zf:
+                zi = zf.infolist()[0]
+            i = zi.header_offset + 30 + len(zi.filename.encode()) + len(zi.extra)
+        dane[i] ^= 0xFF
+        z.write_bytes(bytes(dane))
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(sp.Blad):
+            sp.rozpakuj_paczke(z, tmp)
+
+    def test_nic_nie_jest_zapisywane_przy_zlej_nazwie_zip(self):
+        z = spakuj(self.folder, self.d / "Inna-1.0.0.zip")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(sp.Blad):
+                sp.rozpakuj_paczke(z, tmp)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main()

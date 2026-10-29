@@ -1,7 +1,7 @@
 {
   "id": "AutoLan",
   "name": "AutoLan v1",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Norbik9554",
   "category": "Sieć",
   "description": "Pilnuje 3-godzinnego dostępu LAN (PacketFence, Politechnika Lubelska): licznik, powiadomienia 10/5/2/1 min, automatyczne odnowienie z tymczasowym rozłączeniem Proton VPN i nadzór nad zawieszonym klientem Protona.",

@@ -4,7 +4,7 @@
     {
       "id": "AutoLan",
       "name": "AutoLan v1",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "author": "Norbik9554",
       "category": "Sieć",
       "description": "Pilnuje 3-godzinnego dostępu LAN (PacketFence, Politechnika Lubelska): licznik, powiadomienia 10/5/2/1 min, automatyczne odnowienie z tymczasowym rozłączeniem Proton VPN i nadzór nad zawieszonym klientem Protona.",
@@ -27,11 +27,11 @@
         "scheduled_task": "tylko budzik komputera (cmd /c exit)"
       },
       "data": "Login, hasło i data wygaśnięcia są szyfrowane DPAPI w client/plugin_data/<folder>/ — nie wchodzą do paczki.",
-      "file": "plugins/AutoLan/AutoLan-1.0.0.zip",
-      "url": "https://raw.githubusercontent.com/Norbik9554/AddonsLoader-Workshop/main/plugins/AutoLan/AutoLan-1.0.0.zip",
-      "sha256": "13cf0d609298d841fdb733b404315841e1676914f6ec2a8738238dfc49354c1a",
-      "size": 28491,
-      "signed": false
+      "file": "plugins/AutoLan/AutoLan-1.0.1.zip",
+      "url": "https://raw.githubusercontent.com/Norbik9554/AddonsLoader-Workshop/main/plugins/AutoLan/AutoLan-1.0.1.zip",
+      "sha256": "2317471d653aae1a16c86f8b7f8e84db5834ea558d06988e8d925929fbb7e7e7",
+      "size": 28961,
+      "signed": true
     },
     {
       "id": "SystemInfo",
@@ -40,12 +40,8 @@
       "author": "Społeczność",
       "category": "System",
       "description": "Sprawdź swój komp i jego paramtery",
-      "tags": [
-        "społeczność"
-      ],
       "platform": "windows",
       "min_client": "0.0.5",
-      "permissions": {},
       "file": "plugins/SystemInfo/SystemInfo-0.0.1.zip",
       "url": "https://raw.githubusercontent.com/Norbik9554/AddonsLoader-Workshop/main/plugins/SystemInfo/SystemInfo-0.0.1.zip",
       "sha256": "54e4b14ad6073da183f05e3ef0177e44936912821a479001edc0bcc476e3bde0",

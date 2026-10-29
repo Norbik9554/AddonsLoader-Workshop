@@ -37,18 +37,27 @@ def main() -> int:
     for meta in sorted((ROOT / "meta").glob("*.json")):
         m = json.loads(meta.read_text(encoding="utf-8"))
         id_, wersja = m["id"], m["version"]
-        if meta.stem != id_ or not (ROOT / "src" / id_ / "logic.py").exists():
-            sys.exit(f"{meta.name}: id musi równać się nazwie pliku, a src/{id_}/logic.py musi istnieć")
-        dane = zbuduj(id_, wersja)
         rel = f"plugins/{id_}/{id_}-{wersja}.zip"
         cel = ROOT / rel
-        if arg.check:
-            if not cel.exists() or cel.read_bytes() != dane:
-                rozbieznosci.append(rel)
+        if meta.stem != id_:
+            sys.exit(f"{meta.name}: id musi równać się nazwie pliku")
+        if not (ROOT / "src" / id_ / "logic.py").exists():
+            # Wtyczka bez źródeł w repozytorium (np. zgłoszona przez społeczność): gotowa paczka zostaje bez zmian, opis ją tylko wskazuje.
+            if not cel.exists():
+                sys.exit(f"{meta.name}: brak src/{id_}/logic.py i brak gotowej paczki {rel}")
+            dane = cel.read_bytes()
+            with zipfile.ZipFile(cel) as z:
+                podpisana = f"{id_}/plugin.sig" in z.namelist()
         else:
-            cel.parent.mkdir(parents=True, exist_ok=True); cel.write_bytes(dane)
+            dane = zbuduj(id_, wersja)
+            podpisana = (ROOT / "src" / id_ / "plugin.sig").exists()
+            if arg.check:
+                if not cel.exists() or cel.read_bytes() != dane:
+                    rozbieznosci.append(rel)
+            else:
+                cel.parent.mkdir(parents=True, exist_ok=True); cel.write_bytes(dane)
         wtyczki.append({**m, "file": rel, "url": BAZA_URL + rel, "sha256": hashlib.sha256(dane).hexdigest(), "size": len(dane),
-                        "signed": (ROOT / "src" / id_ / "plugin.sig").exists()})
+                        "signed": podpisana})
     manifest = {"schema": 1, "plugins": wtyczki}
     tekst = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
     if arg.check:

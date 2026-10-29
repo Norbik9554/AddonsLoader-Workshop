@@ -24,6 +24,7 @@ import re
 import sys
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 
 try:
@@ -209,13 +210,16 @@ def rozpakuj_paczke(zip_path, cel) -> tuple:
         if not wpisy or len(wpisy) > MAX_PLIKOW:
             raise Blad(f"liczba wpisów poza zakresem 1..{MAX_PLIKOW}")
         id_ = wpisy[0].filename.split("/")[0]
-        if not RE_ID.match(id_):
+        if not RE_ID.match(id_) or id_.split(".")[0].upper() in ZARZADZONE:
             raise Blad(f"niepoprawny folder główny: {id_!r}")
         widziane, razem, doZapisu = set(), 0, []
         for zi in wpisy:
             nazwa = zi.filename
             if zi.flag_bits & 0x1:
                 raise Blad(f"{nazwa}: wpis zaszyfrowany")
+            # Jak klient (workshop_install.py): bzip2/lzma zipfile dekompresuje bez limitu wyjścia — klient takiej paczki nie przyjmie.
+            if zi.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                raise Blad(f"{nazwa}: niedozwolona metoda kompresji ({zi.compress_type}); użyj ZIP_DEFLATED")
             if (zi.external_attr >> 16) & 0o170000 == 0o120000:
                 raise Blad(f"{nazwa}: dowiązanie symboliczne")
             katalog = nazwa.endswith("/")
@@ -247,18 +251,24 @@ def rozpakuj_paczke(zip_path, cel) -> tuple:
             doZapisu.append((zi, rel))
         if "logic.py" not in widziane:
             raise Blad("w paczce musi być logic.py")
+        foldery = {"/".join(rel.lower().split("/")[:i]) for _, rel in doZapisu for i in range(1, rel.count("/") + 1)}
+        if kolizja := widziane & foldery:
+            raise Blad(f"{min(kolizja)}: ta sama nazwa jako plik i jako folder")
+        m = re.fullmatch(r"(.+)-(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\.zip", zip_path.name)
+        if not m or m.group(1) != id_:
+            raise Blad(f"nazwa pliku powinna brzmieć {id_}-<wersja>.zip")
         korzen = Path(cel) / id_
         for zi, rel in doZapisu:
             plik = korzen.joinpath(*rel.split("/"))
             plik.parent.mkdir(parents=True, exist_ok=True)
-            with z.open(zi) as f:
-                dane = f.read(zi.file_size + 1)
+            try:
+                with z.open(zi) as f:
+                    dane = f.read(zi.file_size + 1)
+            except (zipfile.BadZipFile, zlib.error, OSError, RuntimeError, EOFError) as e:   # zły CRC, uszkodzony deflate, rozjazd nagłówków
+                raise Blad(f"{zi.filename}: {e}")
             if len(dane) != zi.file_size:
                 raise Blad(f"{zi.filename}: rozmiar niezgodny z nagłówkiem")
             plik.write_bytes(dane)
-    m = re.fullmatch(r"(.+)-(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\.zip", zip_path.name)
-    if not m or m.group(1) != id_:
-        raise Blad(f"nazwa pliku powinna brzmieć {id_}-<wersja>.zip")
     return id_, m.group(2)
 
 
@@ -340,7 +350,7 @@ def cmd_sign(a) -> int:
     folder = Path(a.folder).resolve()
     plugin_id = a.id or folder.name
     sig = sign_folder(folder, wczytaj_klucz(a.key), plugin_id, a.version, a.name or "", a.signed_at)
-    print(f"Podpisano '{plugin_id}' {a.version}: {len(sig['payload']['files'])} plików, klucz {sig['key_id']} → {folder / SIG_FILE}")
+    print(f"Podpisano '{plugin_id}' {a.version}: {len(sig['payload']['files'])} plików, klucz {sig['key_id']} -> {folder / SIG_FILE}")   # bez „→”: konsola cp1250 z przekierowanym wyjściem go nie zakoduje
     return 0
 
 
