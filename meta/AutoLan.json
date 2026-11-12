@@ -1,14 +1,25 @@
 {
   "id": "AutoLan",
   "name": "AutoLan v1",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "Norbik9554",
   "category": "Sieć",
-  "description": "Pilnuje 3-godzinnego dostępu LAN (PacketFence, Politechnika Lubelska): licznik, powiadomienia 10/5/2/1 min, automatyczne odnowienie z tymczasowym rozłączeniem Proton VPN i nadzór nad zawieszonym klientem Protona.",
+  "description": "Pilnuje 3-godzinnego dostępu LAN (PacketFence, Politechnika Lubelska): licznik, powiadomienia 10/5/2/1 min, automatyczne odnowienie z tymczasowym rozłączeniem Proton VPN i nadzór nad zawieszonym klientem Protona. Od 1.0.2 funkcje Windows idą przez Loadera (native_api), bez ctypes.",
   "tags": ["lan", "vpn", "proton", "windows", "eduroam"],
   "platform": "windows",
-  "min_client": "0.0.5",
+  "min_client": "0.0.6-beta",
   "grid": {"width": 7, "height": 9},
-  "permissions": {"network": true, "ui_automation": true, "scheduled_task": "tylko budzik komputera (cmd /c exit)"},
+  "permissions": {
+    "network": true,
+    "ui_automation": true,
+    "scheduled_task": "tylko budzik komputera (cmd /c exit)",
+    "admin.network.adapter": "włączanie i wyłączanie karty LAN / Wi-Fi przez akcje administracyjne Loadera",
+    "dpapi": "szyfrowanie loginu i hasła na tym koncie Windows",
+    "credentials.read": "odczyt hasła z Menedżera poświadczeń Windows",
+    "network.dhcp": "odnowienie adresu IP (DHCP)",
+    "ui.window_state": "sprawdzanie, czy okno Protona nie zawisło",
+    "sync.mutex": "jedna kopia backendu naraz",
+    "lib": "wmi, psutil, pywin32, comtypes"
+  },
   "data": "Login, hasło i data wygaśnięcia są szyfrowane DPAPI w client/plugin_data/<folder>/ — nie wchodzą do paczki."
 }
