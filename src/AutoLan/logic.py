@@ -12,12 +12,18 @@ klienta), rozłączanie VPN z weryfikacją (Proton potrafi połączyć się sam)
 przed ruszeniem VPN, globalny limit czasu odnawiania, wykrywanie wybudzenia z uśpienia, pauza po serii porażek, zapasowe adresy
 sondy, kontrola sensowności daty z portalu.
 
-Hasło jest w Menedżerze poświadczeń (okno i backend czytają je ctypes) i nigdy nie przechodzi przez komunikaty Loadera.
+Hasło jest w pliku szyfrowanym DPAPI i nigdy nie przechodzi przez komunikaty Loadera. Funkcje natywne Windows (DPAPI, Menedżer
+poświadczeń, iphlpapi, IsHungAppWindow, mutex) idą przez broker Loadera native_api — bez ctypes, za zgodą użytkownika.
 """
 
 PLUGIN_API_VERSION = "2.0"
+# Uprawnienia brokera native_api (Loader pyta użytkownika raz na wersję plików wtyczki). admin.network.adapter: włączanie
+# i wyłączanie kart LAN / Wi-Fi przez akcje administracyjne Loadera (karty zatwierdza administrator w Ustawieniach).
+# lib.*: biblioteki systemowe, których wtyczka używa wprost — wmi i psutil (stan kart i procesów), pywin32 (okna, COM),
+# comtypes (UI Automation okna logowania do sieci).
+PLUGIN_PERMISSIONS = ["dpapi", "credentials.read", "network.dhcp", "ui.window_state", "sync.mutex", "admin.network.adapter",
+                      "lib.wmi", "lib.psutil", "lib.pywin32", "lib.comtypes"]
 
-import ctypes
 import html
 import json
 import multiprocessing
@@ -34,6 +40,7 @@ from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDateTimeEdit, QFrame, QGridLayout, QHBoxLayout, QLabel,
                                QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout)
 
+import native_api
 from plugin_core import BasePlugin
 
 PLUGIN_ID = "eduroam_autorenew"
@@ -44,7 +51,7 @@ HEARTBEAT_CO_S = 5.0
 POWIADOMIENIA_MIN = (10, 5, 2, 1)
 RENEW_DEADLINE_S = 900           # globalny limit czasu jednego odnawiania
 FAIL_BACKOFF_AFTER, FAIL_BACKOFF_S, COOLDOWN_S = 3, 1800, 180
-PRZED_WYGASNIECIEM_S = 20        # tyle s przed końcem sesji rozłączamy VPN, żeby portal był od razu po wygaśnięciu
+PRZED_WYGASNIECIEM_S = 25        # tyle s przed końcem sesji rozłączamy VPN, żeby portal był od razu po wygaśnięciu
 TYK_BLISKO_S = 2.0               # szybsza sonda w pobliżu wygaśnięcia (±2 min)
 WAKE_GAP_S = 90                  # przerwa w pętli dłuższa niż to = komputer spał
 PROTON_UI_UNKNOWN_S = 30         # tyle s okno Protona bez przycisków Połącz/Rozłącz = zawieszenie
@@ -55,6 +62,8 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 EXPIRY_RE = re.compile(r"(?:wyrejestrowania|deregist\w*|expires?)[^0-9]{0,20}(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", re.I)
 BAD_LOGIN_RE = re.compile(r"invalid login or password|nieprawid\w+\s+(?:login|has[łl]o|nazw)|incorrect (?:user|pass)", re.I)
 SEKRET_RE = re.compile(r"pass|pwd|has[lł]o", re.I)
+JAK_DAC_UPRAWNIENIA = ("zaznacz kartę w Loaderze: Ustawienia → Bezpieczeństwo → Akcje administracyjne → Zarządzaj "
+                       "i zezwól wtyczce na akcje administracyjne")
 STRICT_TAB_RE = re.compile(r"username/password login", re.I)
 OKNO_PRZEGLADARKI_RE = re.compile(r"google chrome|microsoft.{0,3}edge|brave|opera|vivaldi|chromium", re.I)   # przeglądarki Chromium
 ID_ROZLACZ, ID_POLACZ, ID_POMIN = "ConnectionCardDisconnectButton", "ConnectionCardConnectButton", "CloseButton"
@@ -62,59 +71,41 @@ ZADANIE = "EduroamAutoRenew-Watch"
 KLIENT_PROTONA = "protonvpn.client.exe"
 DOMYSLNE = {"access_hours": 3, "notify_min": list(POWIADOMIENIA_MIN), "lead_min": 15,
             "campus_prefixes": ["172.30."], "campus_gateways": [], "auto": True, "budzik": False,
-            "wait_after_vpn_s": 10, "portal_wait_s": 60, "portal_hosty": ["packetfence"]}
+            "wait_after_vpn_s": 10, "portal_wait_s": 60, "portal_hosty": ["packetfence"],
+            "krok_proton": True, "krok_lan": False, "krok_wifi": False,      # kroki procedury odnawiania
+            "adapter_lan": "Ethernet", "adapter_wifi": "Wi-Fi", "lan_reset_s": 5}
 _TEKST, _AKCENT, _OK, _OSTRZ, _BLAD, _SZARY = "#c9d1d9", "#58a6ff", "#3fb950", "#d29922", "#f85149", "#8b949e"
 
 
 # =============================================================================================
 #  DANE SZYFROWANE (Windows DPAPI): login, hasło i data wygaśnięcia — używa okno i backend
-#  Pliki leżą w osobnym folderze wtyczki: client\plugin_data\<nazwa wtyczki>\ (poswiadczenia.dat, stan.dat).
+#  Pliki leżą w osobnym folderze wtyczki: <obok folderu wtyczek>\plugin_data\<nazwa wtyczki>\ (poswiadczenia.dat, stan.dat).
 #  Odczyt jest możliwy tylko na tym koncie Windows i tym komputerze. Hasło i login nie przechodzą przez komunikaty
 #  Loadera (te trafiają do jego logów), a data wygaśnięcia w komunikatach jest szyfrowana.
 # =============================================================================================
 _ENTROPIA = b"EduroamAutoRenew-v2"
 
 
-class _BLOB(ctypes.Structure):
-    _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
-
-
-def _do_blobu(dane: bytes):
-    bufor = (ctypes.c_ubyte * max(1, len(dane))).from_buffer_copy(dane or b"\0")
-    return _BLOB(len(dane), ctypes.cast(bufor, ctypes.POINTER(ctypes.c_ubyte))), bufor
-
-
 def dpapi_szyfruj(tekst: str) -> bytes:
-    wej, _b1 = _do_blobu(tekst.encode("utf-8"))
-    ent, _b2 = _do_blobu(_ENTROPIA)
-    wyj = _BLOB()
-    if not ctypes.windll.crypt32.CryptProtectData(ctypes.byref(wej), "EduroamAutoRenew", ctypes.byref(ent), None, None, 0,
-                                                  ctypes.byref(wyj)):
-        raise OSError("CryptProtectData")
-    try:
-        return ctypes.string_at(wyj.pbData, wyj.cbData)
-    finally:
-        ctypes.windll.kernel32.LocalFree(wyj.pbData)
+    return native_api.dpapi_protect(tekst.encode("utf-8"), _ENTROPIA, "EduroamAutoRenew")
 
 
 def dpapi_odszyfruj(dane: bytes):
     if not dane:
         return None
-    wej, _b1 = _do_blobu(dane)
-    ent, _b2 = _do_blobu(_ENTROPIA)
-    wyj = _BLOB()
-    if not ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(wej), None, ctypes.byref(ent), None, None, 0, ctypes.byref(wyj)):
-        return None
-    try:
-        return ctypes.string_at(wyj.pbData, wyj.cbData).decode("utf-8")
-    finally:
-        ctypes.windll.kernel32.LocalFree(wyj.pbData)
+    wynik = native_api.dpapi_unprotect(dane, _ENTROPIA)
+    return wynik.decode("utf-8") if wynik is not None else None
 
 
 def katalog_danych() -> Path:
-    """Osobny folder wtyczki: client/plugin_data/<nazwa> (obok katalogu plugins); w trybie deweloperskim: obok pliku."""
+    """Osobny folder wtyczki: <katalog nadrzędny folderu wtyczek>/plugin_data/<nazwa>; w trybie deweloperskim: obok pliku.
+
+    Folder wtyczek może mieć dowolną nazwę (instalator, `advanced.plugins_dir`), więc o „uruchomieniu przez Loader” decyduje
+    też katalog roboczy: Loader ustawia go na katalog nadrzędny folderu wtyczek (tam leży plugin_data). Zapis do folderu
+    samej wtyczki dodałby pliki spoza `plugin.sig` i zablokował wtyczkę oficjalną."""
     tu = Path(__file__).resolve().parent
-    katalog = (tu.parent.parent / "plugin_data" / tu.name) if tu.parent.name.lower() == "plugins" else (tu / "plugin_data")
+    przez_loader = tu.parent.name.lower() == "plugins" or Path.cwd().resolve() == tu.parent.parent
+    katalog = (tu.parent.parent / "plugin_data" / tu.name) if przez_loader else (tu / "plugin_data")
     katalog.mkdir(parents=True, exist_ok=True)
     return katalog
 
@@ -166,27 +157,8 @@ def _odszyfruj_hex(hex_tekst):
 
 
 # --- jednorazowa migracja z poprzedniej wersji (Menedżer poświadczeń Windows) ---------------------
-class _FILETIME(ctypes.Structure):
-    _fields_ = [("lo", ctypes.c_uint32), ("hi", ctypes.c_uint32)]
-
-
-class _CRED(ctypes.Structure):
-    _fields_ = [("Flags", ctypes.c_uint32), ("Type", ctypes.c_uint32), ("TargetName", ctypes.c_wchar_p),
-                ("Comment", ctypes.c_wchar_p), ("LastWritten", _FILETIME), ("CredentialBlobSize", ctypes.c_uint32),
-                ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)), ("Persist", ctypes.c_uint32),
-                ("AttributeCount", ctypes.c_uint32), ("Attributes", ctypes.c_void_p), ("TargetAlias", ctypes.c_wchar_p),
-                ("UserName", ctypes.c_wchar_p)]
-
-
 def _cred_czytaj(cel: str):
-    p = ctypes.POINTER(_CRED)()
-    if not ctypes.windll.advapi32.CredReadW(cel, 1, 0, ctypes.byref(p)):
-        return None
-    try:
-        c = p.contents
-        return ctypes.string_at(c.CredentialBlob, c.CredentialBlobSize).decode("utf-16-le")
-    finally:
-        ctypes.windll.advapi32.CredFree(p)
+    return native_api.read_generic_credential(cel)
 
 
 def migruj_poswiadczenia() -> bool:
@@ -322,16 +294,51 @@ class EduroamWidget(QFrame):
         uklad.addLayout(sesja)
 
         opcje = QHBoxLayout()
-        self._auto = QCheckBox("Odnawiaj automatycznie")
+        self._auto = QPushButton()                                           # duży przełącznik: blokada / załadowanie automatu
+        self._auto.setCheckable(True)
         self._auto.setChecked(True)
-        self._auto.clicked.connect(lambda on: self.action_requested.emit({"action": "set_settings", "auto": bool(on)}))
+        self._auto.setMinimumHeight(34)
+        self._auto.setToolTip("Wyłączony automat nie odnawia dostępu i nie rozłącza VPN; trwające odnawianie zostaje przerwane.\n"
+                              "Ręczne „Odnów teraz” nadal działa.")
+        self._auto.clicked.connect(self._przelacz_automat)
+        self._styl_automatu(True)
         self._budzik = QCheckBox("Budź z uśpienia przed końcem")
         self._budzik.setToolTip("Zadanie w Harmonogramie zadań tylko BUDZI komputer 15 min przed końcem sesji "
                                 "(nie uruchamia drugiego Loadera) — Loader musi być uruchomiony")
         self._budzik.clicked.connect(self._przelacz_budzik)
-        opcje.addWidget(self._auto)
+        opcje.addWidget(self._auto, 2)
         opcje.addWidget(self._budzik)
         uklad.addLayout(opcje)
+
+        urzadzenia = QHBoxLayout()                                           # ręczne włączanie / wyłączanie urządzeń
+        urzadzenia.addWidget(QLabel("Urządzenia:"))
+        self._sw = {}
+        for klucz, etykieta in (("vpn", "Proton VPN"), ("lan", "Karta LAN"), ("wifi", "Wi-Fi")):
+            b = QPushButton(f"{etykieta}: …")
+            b.setCheckable(True)
+            b.setEnabled(False)
+            b.setMinimumHeight(30)
+            b.clicked.connect(lambda on, k=klucz: self._przelacz_urzadzenie(k, bool(on)))
+            self._sw[klucz] = (b, etykieta)
+            urzadzenia.addWidget(b, 1)
+        uklad.addLayout(urzadzenia)
+
+        kroki = QHBoxLayout()                                                # co wchodzi w skład procedury odnawiania
+        kroki.addWidget(QLabel("W procedurze:"))
+        self._kroki = {}
+        for klucz, etykieta, podpowiedz in (
+                ("krok_proton", "rozłącz Proton VPN", "Na czas odnawiania rozłącza Proton VPN, a po sukcesie łączy go z powrotem"),
+                ("krok_lan", "zresetuj kartę LAN", "Po rozłączeniu VPN wyłącza kartę LAN na kilka sekund i włącza ją z powrotem "
+                                                   "(wymaga akcji administracyjnych Loadera; bez nich odświeża tylko adres IP)"),
+                ("krok_wifi", "wyłącz Wi-Fi", "Na czas odnawiania wyłącza Wi-Fi, żeby portal otworzył się przez LAN, "
+                                              "i włącza je z powrotem (wymaga akcji administracyjnych Loadera)")):
+            c = QCheckBox(etykieta)
+            c.setToolTip(podpowiedz)
+            c.clicked.connect(lambda on, k=klucz: self.action_requested.emit({"action": "set_settings", k: bool(on)}))
+            self._kroki[klucz] = c
+            kroki.addWidget(c)
+        self._kroki["krok_proton"].setChecked(True)
+        uklad.addLayout(kroki)
 
         przyciski = QHBoxLayout()
         self._b_portal = QPushButton("Otwórz portal")
@@ -351,6 +358,49 @@ class EduroamWidget(QFrame):
         self._log.setMaximumBlockCount(500)
         uklad.addWidget(self._log, 1)
 
+    def _styl_przelacznika(self, klucz: str, stan):
+        """stan: True = włączone, False = wyłączone, None = brak urządzenia / nieznany."""
+        b, etykieta = self._sw[klucz]
+        b.blockSignals(True)
+        b.setChecked(bool(stan))
+        b.blockSignals(False)
+        b.setEnabled(stan is not None and not self._odnawia)
+        tekst = {True: "WŁĄCZONY", False: "WYŁĄCZONY", None: "brak"}[stan]
+        kolor = {True: _OK, False: _SZARY, None: "#30363d"}[stan]
+        b.setText(f"{etykieta}: {tekst}")
+        b.setStyleSheet(f"QPushButton {{ background: {kolor}; color: #0d1117; font-weight: bold; border: none; "
+                        "border-radius: 4px; padding: 4px; }")
+        b.setToolTip({True: "Kliknij, aby wyłączyć", False: "Kliknij, aby włączyć",
+                      None: "Nie znaleziono urządzenia (nazwa karty: adapter_lan / adapter_wifi w ustawieniach)"}[stan])
+
+    def _przelacz_urzadzenie(self, klucz: str, on: bool):
+        self._sw[klucz][0].setEnabled(False)                                 # do czasu odpowiedzi backendu
+        self.action_requested.emit({"action": "toggle_device", "device": klucz, "on": on})
+
+    def _zastosuj_urzadzenia(self, u, brak_admina=None):
+        if brak_admina is not None:
+            self._brak_admina = bool(brak_admina)
+        if isinstance(u, dict):
+            for klucz in self._sw:
+                self._styl_przelacznika(klucz, u.get(klucz))
+        if getattr(self, "_brak_admina", False):
+            for klucz in ("lan", "wifi"):
+                b, _etykieta = self._sw[klucz]
+                b.setText(b.text() + " (wymaga admina)")
+                b.setToolTip(f"Windows odmówił sterowania kartą — {JAK_DAC_UPRAWNIENIA}")
+            for klucz in ("krok_lan", "krok_wifi"):
+                self._kroki[klucz].setToolTip(f"Pomijany: Windows odmówił sterowania kartami — {JAK_DAC_UPRAWNIENIA}")
+
+    def _styl_automatu(self, on: bool):
+        self._auto.setText("AUTOMAT: WŁĄCZONY — kliknij, aby zablokować" if on else "AUTOMAT: WYŁĄCZONY — kliknij, aby załadować")
+        self._auto.setStyleSheet(f"QPushButton {{ background: {_OK if on else _BLAD}; color: #0d1117; font-weight: bold; "
+                                 "border: none; border-radius: 4px; padding: 6px; }")
+
+    def _przelacz_automat(self, on: bool):
+        self._styl_automatu(on)
+        self.action_requested.emit({"action": "set_settings", "auto": bool(on)})
+        self._tykniecie()
+
     # --- licznik i baner (lokalnie, co sekundę) -----------------------------------------------
     def _tykniecie(self):
         zostalo = (self._wygasa - datetime.now()).total_seconds() if self._wygasa else None
@@ -363,6 +413,8 @@ class EduroamWidget(QFrame):
             self._licznik.setStyleSheet(f"color: {_OK if zostalo > 600 else (_OSTRZ if zostalo > 120 else _BLAD)};")
         if self._odnawia:
             tekst, kolor = "ODNAWIANIE DOSTĘPU…", _OSTRZ
+        elif not self._auto.isChecked():
+            tekst, kolor = "AUTOMAT WYŁĄCZONY — wtyczka nie odnawia ani nie rozłącza VPN", _BLAD
         elif self._kampus is False:
             tekst, kolor = "POZA SIECIĄ UCZELNI — wtyczka nic nie robi", _SZARY
         elif zostalo is None:
@@ -448,6 +500,8 @@ class EduroamWidget(QFrame):
             self._zastosuj_tick(dane)
         elif typ == "settings":
             self._zastosuj_ustawienia(dane)
+        elif typ == "devices":
+            self._zastosuj_urzadzenia(dane.get("stany"), dane.get("brak_admina"))
         elif typ == "proton":
             ok = dane.get("stan") == "ok"
             self._pola["proton"].setText(f"<span style='color:{_OK if ok else _BLAD}'>{html.escape(str(dane.get('stan')))}</span>"
@@ -477,6 +531,7 @@ class EduroamWidget(QFrame):
         self._pola["kampus"].setText("tak" if d.get("kampus") else "nie")
         self._pola["karta"].setText(f"{d.get('alias') or '—'} · {d.get('ip') or '—'} · brama {d.get('gw') or '—'}")
         self._pola["ostatnie"].setText(str(d.get("ostatnie") or "—"))
+        self._zastosuj_urzadzenia(d.get("urz"), d.get("brak_admina"))
         self._b_portal.setEnabled(st != "ONLINE")
         self._b_portal.setToolTip("Dostęp jest już pełny — portal pojawi się po wygaśnięciu" if st == "ONLINE" else "")
         try:                                                                 # data wygaśnięcia przychodzi zaszyfrowana
@@ -495,6 +550,9 @@ class EduroamWidget(QFrame):
     def _zastosuj_ustawienia(self, d: dict):
         self._odswiez_dane()
         self._auto.setChecked(bool(d.get("auto", True)))
+        self._styl_automatu(self._auto.isChecked())
+        for klucz, c in self._kroki.items():
+            c.setChecked(bool(d.get(klucz, klucz == "krok_proton")))
         self._budzik.setChecked(bool(d.get("budzik", False)))
         przekroczone = d.get("notify_min")
         if isinstance(przekroczone, list) and przekroczone:
@@ -504,6 +562,10 @@ class EduroamWidget(QFrame):
 # =============================================================================================
 #  CZĘŚĆ 2: WTYCZKA + BACKEND (piaskownica; importy ciężkich bibliotek leniwie, w funkcjach)
 # =============================================================================================
+class PrzerwanoNaZadanie(Exception):
+    """Użytkownik wyłączył automat w trakcie odnawiania."""
+
+
 class EduroamWtyczka(BasePlugin):
     @staticmethod
     def get_config():
@@ -513,7 +575,7 @@ class EduroamWtyczka(BasePlugin):
             "category": "Sieć",
             "description": "Pilnuje 3-godzinnego dostępu LAN (PacketFence): licznik, toasty 10/5/2/1 min, automatyczne "
                            "odnowienie z rozłączeniem i połączeniem Proton VPN, nadzór nad zawieszonym klientem Protona. "
-                           "Używa ctypes, psutil, wmi, comtypes, urllib (żółte ostrzeżenia skanera).",
+                           "Używa brokera native_api, psutil, wmi, comtypes, urllib (żółte ostrzeżenia skanera).",
             "author": "AutoLan",
             "version": "1.0.0",
             "width": 7,
@@ -567,7 +629,8 @@ class EduroamWtyczka(BasePlugin):
     def _wyslij_ustawienia(self) -> None:
         c = self.cfg
         self._wyslij({"type": "settings", "auto": c["auto"], "budzik": c["budzik"],
-                      "notify_min": c["notify_min"], "lead_min": c["lead_min"]})
+                      "notify_min": c["notify_min"], "lead_min": c["lead_min"],
+                      "krok_proton": c["krok_proton"], "krok_lan": c["krok_lan"], "krok_wifi": c["krok_wifi"]})
 
     @staticmethod
     def _com_init() -> list:
@@ -641,6 +704,34 @@ class EduroamWtyczka(BasePlugin):
         finally:
             conn.close()
 
+    @staticmethod
+    def _tcp_ok(host: str = "1.1.1.1", port: int = 443, timeout: float = 1.2) -> bool:
+        """Czy da się otworzyć połączenie TCP do internetu (bez DNS i HTTP) — tak samo szybko, jak ping w MonitorNET."""
+        import socket
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def _probe_szybko(self, vpn_up: bool, wygasl: bool) -> str:
+        """Sonda z twardym limitem 4 s: DNS przez martwy tunel VPN potrafi wisieć dziesiątki sekund (limit czasu gniazda go nie
+        obejmuje), a trzy adresy sprawdzane po kolei dawały ponad minutę zwłoki. Po wygaśnięciu sesji przy włączonym VPN
+        wystarczy brak połączenia TCP z internetem — nie czekamy na HTTP."""
+        if vpn_up and wygasl and not self._tcp_ok():
+            return "OFFLINE"
+        wynik: dict = {}
+
+        def praca():
+            try:
+                wynik["v"] = self._probe()
+            except Exception:                                                # noqa: BLE001
+                wynik["v"] = "OFFLINE"
+        t = threading.Thread(target=praca, daemon=True)
+        t.start()
+        t.join(4.0)
+        return wynik.get("v", "OFFLINE")
+
     def _probe(self) -> str:
         """ONLINE / PORTAL / OFFLINE / BLOKADA_VPN. Gdy główny adres nie odpowiada, pytamy zapasowe — chwilowa awaria
         jednego serwera nie wywołuje fałszywego odnawiania."""
@@ -664,6 +755,8 @@ class EduroamWtyczka(BasePlugin):
     def _czekaj_na_stan(self, chciane: set, limit_s: float, co_s: float = 3.0) -> str:
         koniec, stan = time.time() + limit_s, "?"
         while time.time() < koniec:
+            if getattr(self, "_przerwij", False):
+                raise PrzerwanoNaZadanie("oczekiwanie na stan sieci")
             stan = self._probe()
             if stan in chciane:
                 return stan
@@ -715,8 +808,128 @@ class EduroamWtyczka(BasePlugin):
         ip, gw = info.get("ip"), info.get("gw")
         return bool(ip and (gw in self.cfg["campus_gateways"] or any(ip.startswith(p) for p in self.cfg["campus_prefixes"])))
 
+    # ----------------------------------------------------------------------------------------
+    #  urządzenia: karta LAN i Wi-Fi (WMI, bez PowerShella) oraz Proton VPN
+    # ----------------------------------------------------------------------------------------
+    @staticmethod
+    def _adapter_wmi(nazwa: str):
+        import wmi
+        for a in wmi.WMI().Win32_NetworkAdapter(NetConnectionID=nazwa):
+            return a
+        return None
+
+    def _adapter_stan(self, nazwa: str):
+        """True = włączona, False = wyłączona w systemie, None = nie ma takiej karty."""
+        a = self._adapter_wmi(nazwa)
+        if a is None:
+            return None
+        return a.ConfigManagerErrorCode != 22                                # 22 = „to urządzenie jest wyłączone”
+
+    def _rodzaj_karty(self, nazwa: str):
+        return "lan" if nazwa == self.cfg["adapter_lan"] else ("wifi" if nazwa == self.cfg["adapter_wifi"] else None)
+
+    def _czekaj_stan_karty(self, nazwa: str, wlacz: bool, limit_s: float) -> bool:
+        koniec = time.time() + limit_s
+        while time.time() < koniec:
+            if self._adapter_stan(nazwa) == wlacz:
+                return True
+            time.sleep(0.5)
+        return False
+
+    @staticmethod
+    def _akcja_administracyjna(nazwa: str, wlacz: bool) -> str:
+        """Akcja administracyjna Loadera (native_api, karta zatwierdzona w Ustawieniach → Bezpieczeństwo → Akcje
+        administracyjne, zgoda użytkownika dla tej wtyczki). Zwraca '' albo powód."""
+        try:
+            wynik = native_api.admin_network_adapter(nazwa, "enable" if wlacz else "disable")
+        except PermissionError:
+            return "brak zgody na akcje administracyjne (Loader zapyta przy następnym uruchomieniu wtyczki)"
+        return "" if wynik["ok"] else wynik["message"]
+
+    def _uruchom_zadanie_karty(self, nazwa: str, wlacz: bool) -> str:
+        """ZAPAS na czas przejścia: stare zadanie Harmonogramu (AutoLan-LAN-On/Off, AutoLan-WiFi-On/Off) utworzone ręcznie
+        skryptem Zainstaluj-uprawnienia-kart.bat. Zastępuje je profil administracyjny Loadera. Zwraca '' albo powód."""
+        rodzaj = self._rodzaj_karty(nazwa)
+        if rodzaj is None:
+            return f"karta „{nazwa}” nie jest ustawiona jako LAN ani Wi-Fi"
+        zadanie = f"AutoLan-{'LAN' if rodzaj == 'lan' else 'WiFi'}-{'On' if wlacz else 'Off'}"
+        try:
+            import win32com.client
+            usluga = win32com.client.Dispatch("Schedule.Service")
+            usluga.Connect()
+            usluga.GetFolder("\\").GetTask(zadanie).Run(None)
+            return ""
+        except Exception as e:                                               # noqa: BLE001
+            return f"zadanie „{zadanie}” niedostępne ({type(e).__name__})"
+
+    def _adapter_ustaw(self, nazwa: str, wlacz: bool, czekaj_s: float = 15) -> tuple:
+        """Włącza / wyłącza kartę. Najpierw WMI (działa, gdy Loader ma uprawnienia administratora); po odmowie — akcja
+        administracyjna Loadera, a gdy jej nie ma — stare zadanie z .bat. Zwraca (powodzenie, opis)."""
+        opis_wmi = ""
+        if not self._wmi_odmowa:
+            try:
+                a = self._adapter_wmi(nazwa)
+                if a is None:
+                    return False, f"nie znaleziono karty „{nazwa}”"
+                kod = (a.Enable() if wlacz else a.Disable())[0]
+                if kod == 0:
+                    if self._czekaj_stan_karty(nazwa, wlacz, czekaj_s):
+                        self._brak_admina = False
+                        return True, "gotowe"
+                    opis_wmi = "WMI przyjęło polecenie, ale stan karty się nie zmienił (brak uprawnień administratora)"
+                else:
+                    opis_wmi = f"WMI zwróciło kod {kod}" + (" (brak uprawnień administratora)" if kod in (5, 2147749891) else "")
+            except Exception as e:                                           # noqa: BLE001
+                opis_wmi = f"WMI: {type(e).__name__}: {str(e)[:60]}"
+            self._wmi_odmowa = True                                          # następne próby od razu przez zadanie
+        sposob = "akcja administracyjna Loadera"
+        blad = self._akcja_administracyjna(nazwa, wlacz)
+        if blad:
+            blad_stary = self._uruchom_zadanie_karty(nazwa, wlacz)
+            if blad_stary:
+                self._brak_admina = True
+                return False, "; ".join(p for p in (opis_wmi, blad, blad_stary) if p) + " — " + JAK_DAC_UPRAWNIENIA
+            sposob = "stare zadanie AutoLan"
+        if self._czekaj_stan_karty(nazwa, wlacz, czekaj_s + 10):
+            self._brak_admina = False
+            return True, f"gotowe ({sposob})"
+        self._brak_admina = True
+        return False, "zadanie uruchomione, ale system nie zmienił stanu karty"
+
+    def _stany_urzadzen(self) -> dict:
+        try:
+            return {"vpn": self._vpn_up(), "lan": self._adapter_stan(self.cfg["adapter_lan"]),
+                    "wifi": self._adapter_stan(self.cfg["adapter_wifi"])}
+        except Exception:                                                    # noqa: BLE001
+            return {"vpn": self._vpn_up(), "lan": None, "wifi": None}
+
+    def _wyslij_urzadzenia(self) -> None:
+        self._wyslij({"type": "devices", "stany": self._stany_urzadzen(), "brak_admina": self._brak_admina})
+
+    def _przelacz_urzadzenie(self, urzadzenie: str, wlacz: bool) -> None:
+        if self.odnawia:
+            self._log("Trwa odnawianie — przełączniki urządzeń są chwilowo zablokowane")
+        elif urzadzenie == "vpn":
+            self._log("VPN: " + ("łączę" if wlacz else "rozłączam"))
+            ok = self._vpn_polacz() if wlacz else self._vpn_rozlacz()
+            self._log(f"VPN {'połączony' if wlacz else 'rozłączony'}" if ok else "VPN: operacja się nie powiodła")
+        elif urzadzenie in ("lan", "wifi"):
+            nazwa = self.cfg["adapter_lan" if urzadzenie == "lan" else "adapter_wifi"]
+            self._log(f"{'Karta LAN' if urzadzenie == 'lan' else 'Wi-Fi'} „{nazwa}”: {'włączam' if wlacz else 'wyłączam'}")
+            ok, opis = self._adapter_ustaw(nazwa, wlacz)
+            self._log(("Gotowe" if ok else "NIE UDAŁO SIĘ") + f" — {opis}")
+        self._wyslij_urzadzenia()
+
+    def _przywroc_karty(self) -> None:
+        """Karty wyłączone przez procedurę zawsze wracają do stanu włączonego (też po błędzie i po przerwaniu)."""
+        for nazwa in list(self._wylaczone):
+            ok, opis = self._adapter_ustaw(nazwa, True)
+            self._log(f"Przywracam kartę „{nazwa}”: " + ("włączona" if ok else f"NIE UDAŁO SIĘ ({opis}) — włącz ją ręcznie"))
+            if ok:
+                self._wylaczone.discard(nazwa)
+
     def _dhcp(self, alias: str, przerwa_s: float = 5) -> bool:
-        """Odświeżenie adresu IP przez iphlpapi (zamiast ipconfig) — bez administratora, bez subprocess."""
+        """Odświeżenie adresu IP przez iphlpapi (broker native_api, zamiast ipconfig) — bez administratora, bez subprocess."""
         import wmi
         idx = None
         for a in wmi.WMI().Win32_NetworkAdapter(NetConnectionID=alias):
@@ -724,22 +937,10 @@ class EduroamWtyczka(BasePlugin):
         if idx is None:
             return False
 
-        class MapaIp(ctypes.Structure):
-            _fields_ = [("Index", ctypes.c_ulong), ("Name", ctypes.c_wchar * 128)]
-        ip = ctypes.windll.iphlpapi
-        rozmiar = ctypes.c_ulong(0)
-        ip.GetInterfaceInfo(None, ctypes.byref(rozmiar))
-        bufor = ctypes.create_string_buffer(rozmiar.value)
-        if ip.GetInterfaceInfo(bufor, ctypes.byref(rozmiar)) != 0:
+        kody = native_api.dhcp_release_renew(idx, przerwa_s)
+        if kody is None:
             return False
-        ile = ctypes.c_long.from_buffer_copy(bufor, 0).value
-        rozm = ctypes.sizeof(MapaIp)
-        mapa = next((m for m in (MapaIp.from_buffer_copy(bufor, 4 + i * rozm) for i in range(ile)) if m.Index == idx), None)
-        if mapa is None:
-            return False
-        r1 = ip.IpReleaseAddress(ctypes.byref(mapa))
-        time.sleep(przerwa_s)
-        r2 = ip.IpRenewAddress(ctypes.byref(mapa))
+        r1, r2 = kody
         for _ in range(20):
             if self._karta_przewodowa(self._karty()):
                 break
@@ -773,7 +974,7 @@ class EduroamWtyczka(BasePlugin):
             ui, auto, okno = self._okno_protona()
             if not okno:
                 return "nowindow"
-            if ctypes.windll.user32.IsHungAppWindow(okno.CurrentNativeWindowHandle):
+            if native_api.is_window_hung(okno.CurrentNativeWindowHandle):
                 return "hung"
             if self._element(ui, auto, okno, ID_ROZLACZ):
                 return "connected"
@@ -947,15 +1148,18 @@ class EduroamWtyczka(BasePlugin):
                 dane[n], submit_ok = v, True
         return dane
 
-    @staticmethod
-    def _zaufany_portal(url: str) -> bool:
-        """Login i hasło tylko na portal w sieci lokalnej — nigdy na stronę w internecie (np. msn.com)."""
+    def _zaufany_portal(self, url: str) -> bool:
+        """Login i hasło tylko na portal uczelni — nigdy na stronę w internecie (np. msn.com). Zaufany jest adres prywatny
+        albo host o nazwie z ustawień (domyślnie „packetfence”): portal PolLub ma nazwę wewnętrzną, która potrafi nie
+        rozwiązać się ponownie albo wskazać adres publiczny uczelni, więc samo sprawdzenie IP odrzucało prawdziwy portal."""
         import ipaddress
         import socket
         import urllib.parse
-        host = urllib.parse.urlsplit(url).hostname or ""
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
         if re.search(r"(microsoft|msn|live|bing|windows|msftconnecttest)\.", host + ".", re.I):
             return False
+        if any(h and h in host for h in (str(x).lower() for x in self.cfg.get("portal_hosty", []))):
+            return True
         try:
             return ipaddress.ip_address(socket.gethostbyname(host)).is_private
         except (OSError, ValueError):
@@ -1124,14 +1328,26 @@ class EduroamWtyczka(BasePlugin):
             time.sleep(0.05)
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
-        def czerwony(x, y) -> bool:
+        def kolor(x, y):
             hdc = win32gui.GetDC(0)
             try:
                 c = win32gui.GetPixel(hdc, x, y)
             finally:
                 win32gui.ReleaseDC(0, hdc)
-            r, g, b = c & 255, (c >> 8) & 255, (c >> 16) & 255
-            return r > 150 and g < 90 and b < 90                             # czerwony przycisk „Akceptuję warunki”
+            if c in (-1, 0xFFFFFFFF):                                        # CLR_INVALID: ekran nieczytelny w tym punkcie
+                return None
+            return c & 255, (c >> 8) & 255, (c >> 16) & 255
+
+        def stan_aup(r) -> tuple:
+            """('red' | 'nored' | 'unknown', próbki) — kilka punktów wewnątrz czerwonego przycisku „Akceptuję warunki”."""
+            y = (r.top + r.bottom) // 2
+            probki = [kolor(x, y) for x in (r.left - 50, r.left - 25, r.right + 25, r.right + 50)]
+            wazne = [c for c in probki if c is not None]
+            if not wazne:
+                return "unknown", probki
+            if any(c[0] > 150 and c[1] < 90 and c[2] < 90 for c in wazne):
+                return "red", probki
+            return "nored", probki
 
         def wpisz(el, tekst) -> bool:
             wz = el.GetCurrentPattern(ui.UIA_ValuePatternId).QueryInterface(ui.IUIAutomationValuePattern)
@@ -1191,24 +1407,38 @@ class EduroamWtyczka(BasePlugin):
             edit_login, _r1 = znajdz(elem, r"u[żz]ytkownika|username|login|e-?mail", edit)
             edit_haslo, _r2 = znajdz(elem, r"has[łl]o|password", edit)
             if aup is not None and not aup_ok:
-                if aup_proby >= 2:
+                if aup_proby >= 3:
                     return False, None, "nie udało się zaakceptować regulaminu w Chrome"
                 aup_proby += 1
-                px, py = r_aup.left - 50, (r_aup.top + r_aup.bottom) // 2
-                if not czerwony(px, py):
-                    aup_ok = True                                            # przycisk niewidoczny = już zaakceptowany
-                    continue
-                self._log("Chrome: akceptuję regulamin")
-                try:
-                    klik_myszy(okno, r_aup)
-                except Exception as e:                                       # noqa: BLE001
-                    self._log(f"Chrome: kliknięcie regulaminu nie powiodło się ({type(e).__name__})")
-                for _ in range(6):
-                    time.sleep(0.5)
-                    if not czerwony(px, py):
-                        aup_ok = True
-                        self._log("Chrome: regulamin zaakceptowany (przycisk zniknął z ekranu)")
+                stan0, probki = stan_aup(r_aup)
+                self._log(f"Chrome: regulamin — przycisk na ekranie ({r_aup.left},{r_aup.top})-({r_aup.right},{r_aup.bottom}), "
+                          f"kolor: {stan0} {probki[:2]}, próba {aup_proby}/3")
+
+                def aup_zniknal() -> bool:
+                    o3, _h3, d3 = znajdz_portal()
+                    return o3 is not None and znajdz(elementy(d3), r"akcept\w*\s+warunki|accept|zgadzam", None, 60)[0] is None
+
+                for metoda in ("invoke", "mysz"):
+                    self._log(f"Chrome: akceptuję regulamin (metoda: {metoda})")
+                    try:
+                        if metoda == "invoke":
+                            aup.GetCurrentPattern(ui.UIA_InvokePatternId).QueryInterface(ui.IUIAutomationInvokePattern).Invoke()
+                        else:
+                            klik_myszy(okno, r_aup)
+                    except Exception as e:                                   # noqa: BLE001
+                        self._log(f"Chrome: metoda „{metoda}” nie zadziałała ({type(e).__name__})")
+                        continue
+                    for _ in range(6):
+                        time.sleep(0.5)
+                        if (stan0 == "red" and stan_aup(r_aup)[0] == "nored") or aup_zniknal():
+                            aup_ok = True
+                            self._log(f"Chrome: regulamin zaakceptowany (metoda: {metoda})")
+                            break
+                    if aup_ok:
                         break
+                if not aup_ok and stan0 != "red":                            # kolor nieczytelny: nie blokuj, portal sam oceni
+                    aup_ok = True
+                    self._log(f"Chrome: nie mogę potwierdzić regulaminu po kolorze ({stan0}) — idę dalej do logowania")
                 continue
             if edit_login is not None and edit_haslo is not None:
                 if not aup_ok:
@@ -1428,6 +1658,8 @@ class EduroamWtyczka(BasePlugin):
     #  odnawianie (maszyna stanów — jak w programie)
     # ----------------------------------------------------------------------------------------
     def _limit_czasu(self, etap: str) -> None:
+        if getattr(self, "_przerwij", False):
+            raise PrzerwanoNaZadanie(etap)
         if time.time() > self._deadline:
             raise TimeoutError(f"przekroczono limit {RENEW_DEADLINE_S // 60} min na etapie: {etap}")
 
@@ -1451,9 +1683,14 @@ class EduroamWtyczka(BasePlugin):
         ok = False
         try:
             self.odnawia = True
+            self._przerwij = False
             self._wyslij({"type": "renewing", "on": True})
             try:
                 ok = self._odnow_wlasciwe(powod, reczne)
+            except PrzerwanoNaZadanie as e:
+                self._log(f"ODNAWIANIE PRZERWANE (automat wyłączony), etap: {e}. Jeśli VPN był rozłączony, połącz go przyciskiem.")
+                self._toast("Odnawianie przerwane — automat wyłączony. VPN może być rozłączony", "warn")
+                self.monitor_pauza_do = time.monotonic() + COOLDOWN_S
             except TimeoutError as e:
                 self.fail_count += 1
                 self._log(f"PRZERWANO ODNAWIANIE: {e}")
@@ -1464,6 +1701,10 @@ class EduroamWtyczka(BasePlugin):
                 self._log(f"BŁĄD odnowienia: {type(e).__name__}: {str(e)[:150]}")
                 self.send_error(f"{PLUGIN_ID}: odnowienie: {type(e).__name__}: {e}")
         finally:
+            try:
+                self._przywroc_karty()
+            except Exception as e:                                           # noqa: BLE001
+                self._log(f"Przywracanie kart: {type(e).__name__}: {str(e)[:80]}")
             self.odnawia = False
             self.bledy = 0
             self._wyslij({"type": "renewing", "on": False})
@@ -1486,7 +1727,19 @@ class EduroamWtyczka(BasePlugin):
         t_start = time.time()
         self._deadline = time.time() + RENEW_DEADLINE_S
         self._preflight_proton()
-        byl_vpn = self._vpn_up()
+        if (cfg.get("krok_wifi") or cfg.get("krok_lan")) and self._brak_admina:
+            self._log(f"Kroki kart (Wi-Fi / reset LAN) pominięte: Windows odmówił wcześniej sterowania kartami "
+                      f"({JAK_DAC_UPRAWNIENIA})")
+        if cfg.get("krok_wifi") and not self._brak_admina:                   # Wi-Fi poza grą, żeby portal szedł przez LAN
+            nazwa_w = cfg["adapter_wifi"]
+            if self._adapter_stan(nazwa_w):
+                ok_w, opis_w = self._adapter_ustaw(nazwa_w, False)
+                self._log(f"Wi-Fi „{nazwa_w}”: wyłączam na czas odnawiania — " + ("gotowe" if ok_w else f"pomijam ({opis_w})"))
+                if ok_w:
+                    self._wylaczone.add(nazwa_w)
+            else:
+                self._log(f"Wi-Fi „{nazwa_w}”: już wyłączone albo brak karty — krok pominięty")
+        byl_vpn = self._vpn_up() and bool(cfg.get("krok_proton", True))
         if byl_vpn:
             t0 = time.time()
             self._log("Rozłączam Proton VPN…")
@@ -1505,6 +1758,22 @@ class EduroamWtyczka(BasePlugin):
                     self._log("Blokada trwa — restartuję klienta Protona, żeby zdjąć kill switch")
                     self._proton_restart()
             self._limit_czasu("po rozłączeniu VPN")
+        if cfg.get("krok_lan") and not self._brak_admina:                    # reset karty LAN (wył/wł) — jak ręcznie
+            nazwa_l = cfg["adapter_lan"]
+            self._log(f"Karta LAN „{nazwa_l}”: wyłączam na {cfg['lan_reset_s']} s")
+            ok_l, opis_l = self._adapter_ustaw(nazwa_l, False)
+            if ok_l:
+                self._wylaczone.add(nazwa_l)
+                time.sleep(max(1, int(cfg["lan_reset_s"])))
+                self._limit_czasu("reset karty LAN")
+                ok_l, opis_l = self._adapter_ustaw(nazwa_l, True)
+                if ok_l:
+                    self._wylaczone.discard(nazwa_l)
+                    for _ in range(20):                                      # czekamy na adres IP po ponownym włączeniu
+                        if self._net_info().get("ip"):
+                            break
+                        time.sleep(1)
+            self._log(f"Karta LAN „{nazwa_l}”: " + ("zresetowana" if ok_l else f"reset nieudany ({opis_l}) — dalej bez niego"))
         self._log("Czekam na portal logowania…")
         przed = powod.startswith("tuż przed")
         stan = self._czekaj_na_stan({"PORTAL"} if przed else {"PORTAL", "ONLINE"}, 25 if reczne else cfg["portal_wait_s"] + 20, 1.0)
@@ -1636,17 +1905,19 @@ class EduroamWtyczka(BasePlugin):
                                   "program odnowi ją sam, VPN rozłączy się na chwilę")
         self.bledy = 0 if stan == "ONLINE" else self.bledy + 1
         if cfg["auto"] and time.monotonic() > self.monitor_pauza_do:
-            if vpn and zostalo is not None and 0 < zostalo <= PRZED_WYGASNIECIEM_S and stan == "ONLINE":
+            if vpn and zostalo is not None and 0 < zostalo <= PRZED_WYGASNIECIEM_S:
                 wynik["powod"] = "tuż przed wygaśnięciem"                      # VPN rozłączamy z wyprzedzeniem (bez czekania na utratę sieci)
+                wynik["log"] = f"Do końca sesji {zostalo:.0f} s (sieć: {stan}) — rozłączam VPN z wyprzedzeniem"
             elif zostalo is not None and zostalo <= 0 and stan != "ONLINE":
                 wynik["powod"] = "upłynął czas dostępu"
+                wynik["log"] = f"Sesja wygasła {-zostalo:.0f} s temu (sieć: {stan}) — startuję odnawianie"
             elif zostalo is not None and zostalo <= -180:
                 wynik["kasuj"] = True
                 wynik["log"] = "Czas dostępu minął, ale internet działa — wygaśnięcie nieaktualne, kasuję"
             elif zostalo is not None and zostalo <= 0 and not self.nieaktualne_zalogowane:
                 self.nieaktualne_zalogowane = True
                 wynik["log"] = "Czas dostępu minął, ale internet jeszcze działa — czekam na jego utratę"
-            elif self.bledy >= 4 and (zostalo is None or zostalo <= 900):
+            elif self.bledy >= max(4, int(20 / getattr(self, "_tyk_aktualny", TYK_S))) and (zostalo is None or zostalo <= 900):
                 wynik["powod"] = f"internet nie działa ({stan})"
         return wynik
 
@@ -1665,9 +1936,23 @@ class EduroamWtyczka(BasePlugin):
                 self.send_error(f"{PLUGIN_ID}: zły format daty {p.get('value')!r}")
         elif akcja == "set_settings":
             if isinstance(p.get("auto"), bool):
-                self.cfg["auto"] = p["auto"]
+                byl, nowy = self.cfg["auto"], p["auto"]
+                self.cfg["auto"] = nowy
+                if byl != nowy:
+                    self._log("Automat " + ("WŁĄCZONY" if nowy else "WYŁĄCZONY (blokada)"))
+                    if not nowy and self.odnawia:
+                        self._przerwij = True                                # trwające odnawianie kończy się na najbliższym etapie
+                    elif nowy:
+                        self.monitor_pauza_do, self.fail_count = 0.0, 0     # ponowne załadowanie zdejmuje pauzy po porażkach
+            for k in ("krok_proton", "krok_lan", "krok_wifi"):
+                if isinstance(p.get(k), bool):
+                    self.cfg[k] = p[k]
+                    self._log(f"Procedura: krok „{k}” " + ("włączony" if p[k] else "wyłączony"))
             self._zapisz_json("ustawienia.json", self.cfg)
             self._wyslij_ustawienia()
+        elif akcja == "toggle_device":
+            if p.get("device") in ("vpn", "lan", "wifi") and isinstance(p.get("on"), bool):
+                self._w_watku(self._przelacz_urzadzenie, p["device"], p["on"])
         elif akcja == "vpn_toggle":
             self._w_watku(self._przelacz_vpn)
         elif akcja == "fix_proton":
@@ -1706,6 +1991,10 @@ class EduroamWtyczka(BasePlugin):
         self._blokada_wyjscia = threading.Lock()
         self._odnawianie = threading.Lock()
         self.odnawia = False
+        self._przerwij = False
+        self._wylaczone: set = set()                                         # karty wyłączone przez procedurę (do przywrócenia)
+        self._brak_admina = False                                            # nie da się sterować kartami (ani WMI, ani zadaniem)
+        self._wmi_odmowa = False                                             # WMI odmówiło — kolejne próby od razu przez zadanie
         self.fail_count = 0
         self.bledy = 0
         self.powiadomione: set = set()
@@ -1714,13 +2003,13 @@ class EduroamWtyczka(BasePlugin):
         self.monitor_po_odnowieniu = False
         self._deadline = 0.0
         # jedna kopia backendu: drugi Loader / przeładowanie wtyczki nie może uruchomić równoległego odnawiania
-        self._mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\EduroamAutoRenewBackend")
-        if ctypes.windll.kernel32.GetLastError() == 183:                     # ERROR_ALREADY_EXISTS
+        self._mutex = native_api.named_mutex("EduroamAutoRenewBackend")
+        if self._mutex.already_existed:
             for _ in range(20):                                              # stara kopia po przeładowaniu jeszcze się zamyka
                 time.sleep(1)
-                ctypes.windll.kernel32.CloseHandle(self._mutex)
-                self._mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\EduroamAutoRenewBackend")
-                if ctypes.windll.kernel32.GetLastError() != 183:
+                self._mutex.close()
+                self._mutex = native_api.named_mutex("EduroamAutoRenewBackend")
+                if not self._mutex.already_existed:
                     break
             else:
                 self.send_error(f"{PLUGIN_ID}: inna kopia backendu już działa — ta kończy pracę")
@@ -1746,6 +2035,7 @@ class EduroamWtyczka(BasePlugin):
             self._w_watku(self._budzik, False)                               # usuń ewentualne stare zadanie budzika
 
         info, ostatnia_siec, ostatni_tyk = {}, 0.0, 0.0
+        urz: dict = {}
         ostatnie_ustawienia = ostatni_heartbeat = ostatni_proton = ostatnia_iteracja = time.monotonic()
         ostatnia_scienna = time.time()
         while True:
@@ -1781,7 +2071,13 @@ class EduroamWtyczka(BasePlugin):
                     self._wyslij({"type": "proton", "stan": s, "opis": o})
                 if teraz - ostatnia_siec > (5 if blisko else 30) or not info:
                     info, ostatnia_siec = self._net_info(), teraz
-                stan_sieci = self._probe()
+                    urz = self._stany_urzadzen()
+                self._tyk_aktualny = TYK_BLISKO_S if blisko else TYK_S
+                wygasl = self.wygasa is not None and datetime.now() >= self.wygasa
+                t_sonda = time.monotonic()
+                stan_sieci = self._probe_szybko(bool(info.get("vpn_up")), wygasl)
+                if time.monotonic() - t_sonda > 3:
+                    self._log(f"Sonda sieci trwała {time.monotonic() - t_sonda:.0f} s (wynik: {stan_sieci})")
                 kampus = self._w_sieci_uczelni(info)
                 d = self._krok_monitora(stan_sieci, kampus, bool(info.get("vpn_up")))
                 if d["toast"]:
@@ -1796,6 +2092,7 @@ class EduroamWtyczka(BasePlugin):
                     self._w_watku(self._odnow, d["powod"], False)
                 self._wyslij({"type": "tick", "stan": stan_sieci, "vpn": bool(info.get("vpn_up")), "kampus": kampus,
                               "alias": info.get("alias"), "ip": info.get("ip"), "gw": info.get("gw"),
+                              "urz": urz, "brak_admina": self._brak_admina,
                               "wygasa_enc": _szyfruj_hex(self.wygasa.strftime(FORMAT_DATY)) if self.wygasa else None,
                               "ostatnie": self.ostatnie, "odnawia": False})
             except Exception as e:   # noqa: BLE001 — pętla backendu ma przeżyć pojedynczy błąd

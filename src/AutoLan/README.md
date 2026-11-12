@@ -6,7 +6,7 @@ portal → nowa data wygaśnięcia → połączenie VPN), „Odnów teraz”, ł
 sprzątanie kart portalu w Chrome, „Otwórz portal” (zablokowane przy działającym dostępie), login/hasło z „Pokaż”.
 
 ## Instalacja
-Skopiuj **cały folder** `EduroamAutoRenew` do `…\Addons Loader V16\client\plugins\` (powstaje `plugins\EduroamAutoRenew\logic.py`),
+Skopiuj **cały folder** `EduroamAutoRenew` do `…\Addons Loader V17\client\plugins\` (powstaje `plugins\EduroamAutoRenew\logic.py`),
 odśwież listę i przeciągnij „Eduroam AutoRenew” na siatkę (7×9). Skaner AST daje tylko żółte ostrzeżenia — w *Ustawieniach* musi być
 wyłączone „Blokuj wtyczki z ostrzeżeniem skanera AST”. **Trzymaj wtyczkę w jednym folderze** (nie kopiuj jej drugi raz pod inną nazwą).
 
@@ -21,6 +21,13 @@ Folder: `…\client\plugin_data\EduroamAutoRenew\`
 
 Login i hasło nie przechodzą przez komunikaty Loadera (te trafiają do jego logów); data wygaśnięcia jest w komunikatach zaszyfrowana, a
 logi wtyczki nie zawierają jej jawnej wartości. Przy pierwszym starcie wtyczka przenosi login i hasło z Menedżera poświadczeń Windows.
+
+## Sterowanie kartami LAN / Wi-Fi (uprawnienia administratora)
+Od 2026-10-21 przez **akcje administracyjne Loadera**: Ustawienia → Bezpieczeństwo → Akcje administracyjne wtyczek → Zarządzaj,
+zaznacz karty (np. „Ethernet”, „Wi-Fi”) → „Zatwierdź (administrator)” (jedno okno UAC), a przy starcie wtyczki zezwól jej na
+„UPRAWNIENIA ADMINISTRATORA” (`admin.network.adapter`). Wtyczka nie działa jako administrator — uruchamia tylko stałe zadania
+dla zatwierdzonych kart. Stary `plugin_data\AutoLan\Zainstaluj-uprawnienia-kart.bat` działa jeszcze jako zapas; w tym samym
+oknie można usunąć jego zadania. Opis: `Pliki informacje MD/PROJEKT_UPRAWNIENIA_ADMINISTRACYJNE.md`.
 
 ## Powiadomienia
 Bez ikony w zasobniku: używa wbudowanych powiadomień Loadera (toast + Centrum Powiadomień).
